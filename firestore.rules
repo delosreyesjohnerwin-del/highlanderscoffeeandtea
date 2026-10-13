@@ -1,0 +1,247 @@
+rules_version = '2';
+
+// Highlanders Coffee & Tea — Firestore rules
+//
+// ## Deploying
+//
+// The Rules editor in the console works, but it cannot be diffed, reviewed or
+// rolled back, and a rule edit here is a security change. Deploy from the CLI
+// against a staged directory instead:
+//
+//   $stage = New-Item -ItemType Directory -Force "$env:TEMP\hl-rules"
+//   Copy-Item firestore.rules "$stage\firestore.rules" -Force
+//   '{"firestore":{"rules":"firestore.rules"}}' > "$stage\firebase.json"
+//   firebase deploy --only firestore:rules --project <project-id> --config "$stage\firebase.json"
+//
+// `--config` is needed because the staged directory is not the project root, and
+// without it the CLI walks upward looking for a `firebase.json` and refuses.
+// Then verify the deployed copy is byte-identical to this file — a silently
+// half-applied ruleset is the failure mode worth guarding against.
+//
+// REST cannot be used instead: `POST .../releases` returns 400 and `PATCH` on a
+// ruleset returns "Unknown name rulesetName". The CLI is the only working path.
+//
+// The one thing worth reading closely: the `users` rules. Role is the entire
+// authorisation model for the admin panel, so it is the one place where a
+// mistake would hand the shop over to the first person who signs up.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- helpers ---------------------------------------------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function myDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    // Reads the caller's role from their own user document. `exists` is checked
+    // first because `get()` on a missing document throws rather than returning
+    // an empty snapshot.
+    function myRole() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? myDoc().data.role
+        : null;
+    }
+
+    function isAdmin() {
+      return myRole() == 'admin';
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // A field may only be written when its value is unchanged, or when the
+    // writer is allowed to change it. This is what makes role promotion safe
+    // without a Cloud Function.
+    function roleUnchanged() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']);
+    }
+
+    // --- users -----------------------------------------------------------
+    //
+    // Bootstrap: a brand-new account may create its own document, but only with
+    // role 'customer'. This is the whole self-promotion defence — an admin is
+    // promoted by editing the field in the console, not from the app.
+    match /users/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+
+      allow create: if isOwner(userId)
+                    && request.resource.data.role == 'customer'
+                    && request.resource.data.uid == request.auth.uid;
+
+      allow update: if isAdmin()
+                    || (isOwner(userId) && roleUnchanged());
+
+      // Deletion is admin-only: a user must not be able to erase the evidence
+      // that an account ever existed.
+      allow delete: if isAdmin();
+    }
+
+    // --- public reference data -------------------------------------------
+    //
+    // The menu is readable by anyone, including signed-out visitors, because the
+    // login screen is the only thing they can see and it may want to show what
+    // is on sale. Writes are admin-only.
+    match /menuCategories/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /menuItems/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /promos/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /settings/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // --- orders ----------------------------------------------------------
+    //
+    // A customer may create their own order and read it; the admin panel reads
+    // and writes all of them. The `customerUid` equality check is what stops a
+    // customer reading somebody else's order history, and the field is required
+    // so it cannot be omitted.
+    match /orders/{orderId} {
+      // Both read rules are written per-document on purpose. Firestore
+      // evaluates a list rule against every document the query *would* return,
+      // so a customer query that omits the customerUid filter fails evaluation
+      // against other customers' orders and is refused with PERMISSION_DENIED.
+      // No request.query clause is needed — and there is no `where` on
+      // request.query to write one with; only limit, offset and orderBy exist.
+      allow get: if isAdmin() || (isSignedIn() && resource.data.customerUid == request.auth.uid);
+      allow list: if isAdmin()
+                  || (isSignedIn() && resource.data.customerUid == request.auth.uid);
+
+      // Customers may create only their own order. The admin exception exists for
+      // exactly one thing: the one-time seed, which writes trading history
+      // attributed to synthetic uids that match no account.
+      //
+      // That exception costs nothing, and it is worth saying why rather than
+      // leaving it as an unexplained `|| isAdmin()`. An admin can already update
+      // any order to any status and delete any order — so an admin could already
+      // manufacture any order that exists. Allowing them to create one directly is
+      // not a new capability, only a shorter path to a state they could reach
+      // anyway. The rule that actually stops a *customer* from claiming someone
+      // else's order is the `customerUid` equality below, and that is unchanged.
+      //
+      // The alternative was not seeding orders at all, which keeps the rule tighter
+      // but leaves the revenue chart, the order pipeline and the active-customer
+      // count all at zero on first run — an empty admin panel reads as a broken
+      // app rather than an empty shop.
+      allow create: if isAdmin()
+                    || (isSignedIn() && request.resource.data.customerUid == request.auth.uid);
+
+      // Customers do not update orders: the status field belongs to the shop, and
+      // letting a client set it would let them mark their own order delivered.
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // --- staff -----------------------------------------------------------
+    //
+    // The roster is admin-only in both directions. Staff are not admins, so they
+    // get no read: there is no screen for them to use it on, and a roster carries
+    // names and phone numbers.
+    match /staffMembers/{id} {
+      allow read, write: if isAdmin();
+    }
+
+    // The attendance log the kiosk scanner appends to. Admin-only for the same
+    // reason as the roster: it is names and times, and no screen exists for a
+    // customer or a staff member to read it.
+    match /shiftEvents/{eventId} {
+      allow read, write: if isAdmin();
+    }
+
+    // The Staff Record sessions: one document per shift, opened by a clock-in and
+    // closed by the matching clock-out. Distinct from `shiftEvents` above — that
+    // is the append-only transition log, this is the mutable session row the
+    // record table prints. Admin-only for the same reason: names and times.
+    match /staffRecords/{recordId} {
+      allow read, write: if isAdmin();
+    }
+
+    // --- drivers ---------------------------------------------------------
+    //
+    // Kept for per-rider documents (live location, last seen). Distinct from
+    // `staffMembers`, which is the roster the admin panel edits.
+    match /drivers/{id} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // --- addresses -------------------------------------------------------
+    match /addresses/{addressId} {
+      allow read: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // --- paymentMethods --------------------------------------------------
+    //
+    // A customer's own linked payment accounts. Scoped to the owner exactly
+    // like addresses. The stored payload is already safe to store — masked
+    // label + tail + gateway token, never a full card number — but scoping
+    // still matters: another customer's account list is nobody else's
+    // business even when it is only masks.
+    match /paymentMethods/{paymentMethodId} {
+      allow read: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // --- paymentGatewayCustomers -----------------------------------------
+    //
+    // Cache mapping each app user to their Xendit Customer id. Written only by
+    // the `linkPaymentMethod` Cloud Function through the admin SDK — clients
+    // never need it, so every client access is denied. Rules do not apply to
+    // admin-SDK writes, so the function keeps working.
+    match /paymentGatewayCustomers/{uid} {
+      allow read, write: if false;
+    }
+
+    // --- notificationTokens ----------------------------------------------
+    //
+    // One document per installed app, keyed by the FCM device token and scoped
+    // to the signed-in user, written by the app itself when it registers for
+    // push. The `onOrderCreated` / `onOrderUpdated` Cloud Functions read it
+    // through the admin SDK (rules do not apply) to find whose devices to push
+    // to, so no client read rule is needed — and no client should be able to
+    // read the list of who else has the app installed, so there is none. A
+    // customer may register their own device and unregister it; the `uid`
+    // equality check stops one customer from re-pointing another's device.
+    match /notificationTokens/{token} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // Two "Home" entries is possible: the rules scope addresses by uid, not by
+    // uniqueness of the label, and enforcing a single default would need a
+    // transaction across every address document of a customer. `defaultAddress`
+    // breaks the tie by taking the first flagged entry, so a duplicate shows as a
+    // list with two rows rather than a wrong delivery address.
+    //
+    // TODO(owner): if customers start creating many addresses, move the default
+    // flag onto `users/{uid}` so it is a single-field write and needs no
+    // cross-document rule at all.
+
+    // Anything not named above is closed. New collections deny by default until
+    // someone thinks about who should reach them.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

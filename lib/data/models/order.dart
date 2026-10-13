@@ -1,0 +1,327 @@
+import 'package:flutter/material.dart';
+
+import 'coverage.dart';
+
+enum OrderStatus {
+  pending,
+  confirmed,
+  preparing,
+  ready,
+  outForDelivery,
+  delivered,
+  failedDelivery,
+  cancelled,
+}
+
+extension OrderStatusX on OrderStatus {
+  String get label => switch (this) {
+        OrderStatus.pending => 'Pending',
+        OrderStatus.confirmed => 'Confirmed',
+        OrderStatus.preparing => 'Preparing',
+        OrderStatus.ready => 'Ready',
+        OrderStatus.outForDelivery => 'Out for delivery',
+        OrderStatus.delivered => 'Delivered',
+        OrderStatus.failedDelivery => 'Failed',
+        OrderStatus.cancelled => 'Cancelled',
+      };
+
+  /// Filled badge for terminal states, outline for in-flight ones.
+  bool get isTerminal => this == OrderStatus.delivered || this == OrderStatus.cancelled;
+
+  /// Orders still moving through the pipeline.
+  bool get isActive =>
+      this != OrderStatus.delivered && this != OrderStatus.cancelled && this != OrderStatus.failedDelivery;
+}
+
+/// One recorded status transition, e.g. "went Out for delivery at 10:42 AM".
+@immutable
+class OrderStatusEvent {
+  const OrderStatusEvent({required this.status, required this.at});
+
+  final OrderStatus status;
+
+  /// When the order entered [status]. Stamped at the moment the admin advances
+  /// or cancels the order, so the customer sees real per-step timestamps.
+  final DateTime at;
+}
+
+enum Fulfillment { pickup, delivery }
+
+extension FulfillmentX on Fulfillment {
+  String get label => this == Fulfillment.pickup ? 'Pick up' : 'Delivery';
+}
+
+enum PaymentMethod { gcash, paymaya, ebank, cash }
+
+extension PaymentMethodX on PaymentMethod {
+  String get label => switch (this) {
+        PaymentMethod.gcash => 'GCash',
+        PaymentMethod.paymaya => 'Maya',
+        PaymentMethod.ebank => 'E-bank',
+        PaymentMethod.cash => 'Cash on delivery',
+      };
+
+  IconData get icon => switch (this) {
+        PaymentMethod.gcash => Icons.account_balance_wallet_outlined,
+        PaymentMethod.paymaya => Icons.phone_iphone_outlined,
+        PaymentMethod.ebank => Icons.account_balance_outlined,
+        PaymentMethod.cash => Icons.payments_outlined,
+      };
+
+  /// Cash is collected by the driver at handover; the rest are prepaid.
+  bool get isPrepaid => this != PaymentMethod.cash;
+}
+
+/// One line in an order.
+@immutable
+class OrderLine {
+  const OrderLine({
+    required this.itemId,
+    required this.name,
+    required this.price,
+    required this.quantity,
+  });
+
+  final String itemId;
+  final String name;
+  final num price;
+  final int quantity;
+
+  num get lineTotal => price * quantity;
+
+  OrderLine copyWith({int? quantity}) => OrderLine(
+        itemId: itemId,
+        name: name,
+        price: price,
+        quantity: quantity ?? this.quantity,
+      );
+}
+
+/// Immutable copy of a delivery address, stored on the order so that later
+/// edits to the customer's saved address never rewrite order history.
+@immutable
+class AddressSnapshot {
+  const AddressSnapshot({
+    required this.label,
+    required this.street,
+    required this.barangayCode,
+    required this.barangayName,
+    this.note,
+    this.distanceKm,
+    this.lat,
+    this.lng,
+  });
+
+  final String label;
+  final String street;
+  final String barangayCode;
+  final String barangayName;
+  final String? note;
+
+  /// The distance and fee that were actually charged at order time, frozen on
+  /// the snapshot so later admin edits to the origin never rewrite history.
+  final double? distanceKm;
+
+  /// GPS pin coordinates, when the address was picked on the map.
+  final double? lat;
+  final double? lng;
+
+  String get oneLine => '$street, $barangayName';
+}
+
+/// A customer order.
+@immutable
+class Order {
+  const Order({
+    required this.id,
+    required this.lines,
+    required this.status,
+    required this.fulfillment,
+    required this.paymentMethod,
+    required this.createdAt,
+    this.updatedAt,
+    this.subtotal = 0,
+    this.deliveryFee = 0,
+    this.distanceKm,
+    this.address,
+    this.customerName,
+    this.pickupCode,
+    this.driverName,
+    this.driverPhone,
+    this.paymentRef,
+    this.promoCode,
+    this.customerUid = '',
+    this.statusHistory = const <OrderStatusEvent>[],
+    this.trackingNumber,
+    this.carrierName,
+    this.carrierUrl,
+  });
+
+  final String id;
+
+  /// Auth uid of the customer who placed this.
+  ///
+  /// This is not decoration: the Firestore rules key every order read on it
+  /// (`resource.data.customerUid == request.auth.uid`), and `create` requires it
+  /// to equal the caller's uid. Without it on the model there would be nowhere
+  /// to keep the value an order was stored under, and the admin panel could not
+  /// hand an order back to the customer who owns it.
+  ///
+  /// Empty means "not attributed" and such an order cannot be written — see
+  /// `FirestoreOrderRepository.saveOrder`, which refuses rather than letting the
+  /// server reject it.
+  final String customerUid;
+
+  final List<OrderLine> lines;
+  final OrderStatus status;
+  final Fulfillment fulfillment;
+  final PaymentMethod paymentMethod;
+  final DateTime createdAt;
+
+  /// When the document was last written, set server-side.
+  ///
+  /// Differs from [createdAt] (a client timestamp frozen at order time): this
+  /// moves on every save, so the backend can detect "this order changed since I
+  /// last looked". Null for orders written before this field existed — they are
+  /// invisible to incremental polling by design, which means backfilled history
+  /// never triggers notifications.
+  final DateTime? updatedAt;
+
+  final num subtotal;
+  final num deliveryFee;
+  final double? distanceKm;
+  final AddressSnapshot? address;
+  final String? customerName;
+  final String? pickupCode;
+  final String? driverName;
+  final String? driverPhone;
+  final String? paymentRef;
+  final String? promoCode;
+
+  /// When the order entered each status, in chronological order.
+  ///
+  /// Empty for orders that predate status tracking — the tracking screen then
+  /// falls back to `createdAt` for the first step and omits the rest.
+  final List<OrderStatusEvent> statusHistory;
+
+  /// Courier fields, mostly meaningful only when a third-party delivery
+  /// service is used. Null (and therefore hidden) for in-house riders.
+  final String? trackingNumber;
+  final String? carrierName;
+  final String? carrierUrl;
+
+  num get total => subtotal + deliveryFee;
+
+  int get itemCount => lines.fold(0, (int sum, OrderLine l) => sum + l.quantity);
+
+  /// When the order last entered [status], or null if it never did.
+  DateTime? enteredAt(OrderStatus status) {
+    DateTime? latest;
+    for (final OrderStatusEvent e in statusHistory) {
+      if (e.status == status && (latest == null || e.at.isAfter(latest))) {
+        latest = e.at;
+      }
+    }
+    return latest;
+  }
+}
+
+/// A saved delivery address.
+@immutable
+class SavedAddress {
+  const SavedAddress({
+    required this.id,
+    required this.label,
+    required this.street,
+    required this.barangayCode,
+    this.note,
+    this.isDefault = false,
+    this.lat,
+    this.lng,
+  });
+
+  final String id;
+  final String label;
+  final String street;
+  final String barangayCode;
+  final String? note;
+  final bool isDefault;
+
+  /// Optional GPS pin coordinates. Null for legacy addresses saved before the
+  /// pin picker existed — those fall back to their barangay's centroid.
+  final double? lat;
+  final double? lng;
+
+  /// Straight-line distance from the café.
+  ///
+  /// When the address carries a GPS pin and the café's coordinates are known,
+  /// this is the real pin-to-café haversine distance. Legacy addresses without
+  /// a pin fall back to the bundled barangay centroid. `cafeLat`/`cafeLng`
+  /// default to the bundled [LumbanCoverage] placeholder; the cart passes the
+  /// live admin-configured coordinates through so both modes share one origin.
+  /// Null when the barangay is not in the coverage table.
+  double? distanceKm({double? cafeLat, double? cafeLng}) {
+    final double clat = cafeLat ?? LumbanCoverage.cafeLat;
+    final double clng = cafeLng ?? LumbanCoverage.cafeLng;
+
+    final double? pinLat = lat;
+    final double? pinLng = lng;
+    if (pinLat != null && pinLng != null) {
+      return haversineKm(lat1: clat, lng1: clng, lat2: pinLat, lng2: pinLng);
+    }
+
+    final Barangay? b = LumbanCoverage.byCode(barangayCode);
+    if (b == null) return null;
+    return haversineKm(lat1: clat, lng1: clng, lat2: b.lat, lng2: b.lng);
+  }
+
+  SavedAddress copyWith({
+    String? label,
+    String? street,
+    String? barangayCode,
+    String? note,
+    bool? isDefault,
+    double? lat,
+    double? lng,
+  }) =>
+      SavedAddress(
+        id: id,
+        label: label ?? this.label,
+        street: street ?? this.street,
+        barangayCode: barangayCode ?? this.barangayCode,
+        note: note ?? this.note,
+        isDefault: isDefault ?? this.isDefault,
+        lat: lat ?? this.lat,
+        lng: lng ?? this.lng,
+      );
+}
+
+/// App user profile.
+@immutable
+class AppUser {
+  const AppUser({
+    required this.uid,
+    required this.fullName,
+    required this.email,
+    this.phone,
+    this.avatarUrl,
+    this.role = UserRole.customer,
+    this.memberTier = 'Gold Member',
+    this.orderCount = 0,
+    this.reviewCount = 0,
+    this.rewards = 0,
+  });
+
+  final String uid;
+  final String fullName;
+  final String email;
+  final String? phone;
+  final String? avatarUrl;
+  final UserRole role;
+  final String memberTier;
+  final int orderCount;
+  final int reviewCount;
+  final num rewards;
+}
+
+enum UserRole { customer, admin }
